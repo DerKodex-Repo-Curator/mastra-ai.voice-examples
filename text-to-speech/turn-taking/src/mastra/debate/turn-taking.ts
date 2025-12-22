@@ -1,6 +1,6 @@
 import { mastra } from "../../mastra";
-import { playAudio, Recorder } from "@mastra/node-audio";
 import * as p from "@clack/prompts";
+import { spawn, ChildProcess } from "child_process";
 
 // Helper function to format text with line wrapping
 function formatText(text: string, maxWidth: number): string {
@@ -24,17 +24,60 @@ function formatText(text: string, maxWidth: number): string {
   return result;
 }
 
-// Initialize audio recorder
-const recorder = new Recorder({
-  outputPath: "./debate.mp3",
-});
+// Simple ffmpeg-based recorder
+let ffmpeg: ChildProcess | null = null;
+
+function startRecorder(outputPath: string) {
+  // Spawn ffmpeg: read raw PCM from stdin, output mp3
+  ffmpeg = spawn(
+    "ffmpeg",
+    [
+      "-y", // Overwrite output
+      "-f",
+      "s16le", // Input format: signed 16-bit little-endian
+      "-ar",
+      "24000", // Sample rate: 24kHz (OpenAI TTS default)
+      "-ac",
+      "1", // Mono
+      "-i",
+      "pipe:0", // Read from stdin
+      "-c:a",
+      "libmp3lame", // MP3 codec
+      "-b:a",
+      "128k", // Bitrate
+      outputPath,
+    ],
+    { stdio: ["pipe", "ignore", "ignore"] },
+  );
+}
+
+function writeToRecorder(chunk: Buffer) {
+  if (ffmpeg?.stdin?.writable) {
+    ffmpeg.stdin.write(chunk);
+  }
+}
+
+function endRecorder(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!ffmpeg) {
+      resolve();
+      return;
+    }
+    ffmpeg.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}`));
+    });
+    ffmpeg.on("error", reject);
+    ffmpeg.stdin?.end(); // Close stdin -> ffmpeg finishes and exits
+  });
+}
 
 // Process one turn of the conversation
 async function processTurn(
   agentName: "optimistAgent" | "skepticAgent",
   otherAgentName: string,
   topic: string,
-  previousResponse: string = ""
+  previousResponse: string = "",
 ) {
   const agent = mastra.getAgent(agentName);
   const spinner = p.spinner();
@@ -51,7 +94,9 @@ async function processTurn(
 
   // Generate text response
   const { text } = await agent.generate(prompt, {
-    temperature: 0.9,
+    modelSettings: {
+      temperature: 0.9,
+    },
   });
 
   spinner.message(`${agent.name} is speaking...`);
@@ -59,13 +104,13 @@ async function processTurn(
   // Convert to speech and play
   const audioStream = await agent.voice.speak(text, {
     speed: 1.2,
-    responseFormat: "wav", // Optional: specify a response format
+    responseFormat: "pcm",
   });
 
   if (audioStream) {
-    audioStream.on("data", (chunk) => {
-      recorder.write(chunk);
-    });
+    for await (const chunk of audioStream) {
+      writeToRecorder(chunk);
+    }
   }
 
   spinner.stop(`${agent.name} said:`);
@@ -74,27 +119,27 @@ async function processTurn(
   const formattedText = formatText(text, 80);
   p.note(formattedText, agent.name);
 
-  if (audioStream) {
-    const speaker = playAudio(audioStream);
-
-    await new Promise<void>((resolve) => {
-      speaker.once("close", () => {
-        resolve();
-      });
-    });
-  }
+  // if (audioStream) {
+  //   const speaker = playAudio(audioStream);
+  //
+  //   await new Promise<void>((resolve) => {
+  //     speaker.once("close", () => {
+  //       resolve();
+  //     });
+  //   });
+  // }
 
   return text;
 }
 
 // Main function to run the debate
 export async function runDebate(topic: string, turns: number = 3) {
-  recorder.start();
+  startRecorder("./debate.mp3");
 
   p.intro("AI Debate - Two Agents Discussing a Topic");
   p.log.info(`Starting a debate on: ${topic}`);
   p.log.info(
-    `The debate will continue for ${turns} turns each. Press Ctrl+C to exit at any time.`
+    `The debate will continue for ${turns} turns each. Press Ctrl+C to exit at any time.`,
   );
 
   let optimistResponse = "";
@@ -109,7 +154,7 @@ export async function runDebate(topic: string, turns: number = 3) {
       "optimistAgent",
       "Skeptic",
       topic,
-      skepticResponse
+      skepticResponse,
     );
 
     responses.push({
@@ -122,7 +167,7 @@ export async function runDebate(topic: string, turns: number = 3) {
       "skepticAgent",
       "Optimist",
       topic,
-      optimistResponse
+      optimistResponse,
     );
 
     responses.push({
@@ -131,7 +176,7 @@ export async function runDebate(topic: string, turns: number = 3) {
     });
   }
 
-  recorder.end();
+  await endRecorder();
   p.outro("Debate concluded! The full audio has been saved to debate.mp3");
 
   return responses;
